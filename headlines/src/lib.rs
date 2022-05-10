@@ -2,90 +2,17 @@ mod headlines;
 
 use eframe::{
     egui::{
-        CentralPanel, CtxRef, Hyperlink, Label, ScrollArea, Separator, TextStyle, TopBottomPanel,
-        Ui, Visuals,
+        CentralPanel, Context, Hyperlink, Label, RichText, ScrollArea, Separator, TextStyle,
+        TopBottomPanel, Ui, Visuals,
     },
-    epi::App,
+    App,
 };
 pub use headlines::{Headlines, Msg, NewsCardData, PADDING};
-use newsapi::NewsAPI;
-use std::{
-    sync::mpsc::{channel, sync_channel, Sender},
-    thread,
-};
 
 impl App for Headlines {
-    fn setup(
-        &mut self,
-        _ctx: &eframe::egui::CtxRef,
-        _frame: &mut eframe::epi::Frame<'_>,
-        _storage: Option<&dyn eframe::epi::Storage>,
-    ) {
-        if let Some(storage) = _storage {
-            self.config = eframe::epi::get_value(storage, "headlines").unwrap_or_default();
-            self.api_key_initialized = !self.config.api_key.is_empty();
-        }
-
-        let api_key = self.config.api_key.to_string();
-
-        let (mut news_tx, news_rx) = channel();
-        let (app_tx, app_rx) = sync_channel(1);
-
-        self.app_tx = Some(app_tx);
-        self.news_rx = Some(news_rx);
-
-        let api_key_web = api_key.clone();
-        let news_tx_web = news_tx.clone();
-
-        #[cfg(not(target_arch = "wasm32"))]
-        thread::spawn(move || {
-            if !api_key.is_empty() {
-                fetch_news(&api_key, &mut news_tx);
-            } else {
-                loop {
-                    match app_rx.recv() {
-                        Ok(Msg::ApiKeySet(api_key)) => {
-                            fetch_news(&api_key, &mut news_tx);
-                        }
-                        Ok(Msg::Refresh) => {
-                            fetch_news(&api_key, &mut news_tx);
-                        }
-                        Err(e) => {
-                            tracing::error!("failed receiving msg: {}", e);
-                        }
-                    }
-                }
-            }
-        });
-
-        #[cfg(target_arch = "wasm32")]
-        gloo_timers::callback::Timeout::new(10, move || {
-            wasm_bindgen_futures::spawn_local(async {
-                fetch_web(api_key_web, news_tx_web).await;
-            });
-        })
-        .forget();
-
-        #[cfg(target_arch = "wasm32")]
-        gloo_timers::callback::Interval::new(500, move || match app_rx.try_recv() {
-            Ok(Msg::ApiKeySet(api_key)) => {
-                wasm_bindgen_futures::spawn_local(fetch_web(api_key.clone(), news_tx.clone()));
-            }
-            Ok(Msg::Refresh) => {
-                let api_key = api_key.clone();
-                wasm_bindgen_futures::spawn_local(fetch_web(api_key, news_tx.clone()));
-            }
-            Err(e) => {
-                tracing::error!("failed receiving msg: {}", e);
-            }
-        })
-        .forget();
-
-        self.configure_fonts(_ctx);
-    }
-
-    fn update(&mut self, ctx: &eframe::egui::CtxRef, frame: &mut eframe::epi::Frame<'_>) {
+    fn update(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
         ctx.request_repaint();
+        // ctx.set_debug_on_hover(true);
 
         if self.config.dark_mode {
             ctx.set_visuals(Visuals::dark());
@@ -99,6 +26,8 @@ impl App for Headlines {
             self.preload_articles();
 
             self.render_top_panel(ctx, frame);
+            render_footer(ctx);
+
             CentralPanel::default().show(ctx, |ui| {
                 if self.articles.is_empty() {
                     ui.vertical_centered_justified(|ui| {
@@ -106,57 +35,16 @@ impl App for Headlines {
                     });
                 } else {
                     render_header(ui);
-                    ScrollArea::auto_sized().show(ui, |ui| {
+                    ScrollArea::vertical().show(ui, |ui| {
                         self.render_news_cards(ui);
                     });
-                    render_footer(ctx);
                 }
             });
         }
     }
 
-    fn save(&mut self, storage: &mut dyn eframe::epi::Storage) {
-        eframe::epi::set_value(storage, "headlines", &self.config);
-    }
-
-    fn name(&self) -> &str {
-        "Headlines"
-    }
-}
-
-fn fetch_news(api_key: &str, news_tx: &mut Sender<NewsCardData>) {
-    if let Ok(response) = NewsAPI::new(&api_key).fetch() {
-        let response_articles = response.articles();
-        for a in response_articles.iter() {
-            let news = NewsCardData {
-                title: a.title().to_string(),
-                url: a.url().to_string(),
-                description: "default description".to_string(),
-            };
-            
-            if let Err(e) = news_tx.send(news) {
-                tracing::error!("Error sending news data: {}", e);
-            }
-        }
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn fetch_web(api_key: String, news_tx: Sender<NewsCardData>) {
-    if let Ok(response) = NewsAPI::new(&api_key).fetch_web().await {
-        let resp_articles = response.articles();
-        for a in resp_articles.iter() {
-            let news = NewsCardData {
-                title: a.title().to_string(),
-                url: a.url().to_string(),
-                description: "default description".to_string(),
-            };
-            if let Err(e) = news_tx.send(news) {
-                tracing::error!("Error sending news data: {}", e);
-            }
-        }
-    } else {
-        tracing::error!("failed fetching news");
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, "headlines", &self.config);
     }
 }
 
@@ -169,16 +57,17 @@ fn render_header(ui: &mut Ui) {
     ui.add(sep);
 }
 
-fn render_footer(ctx: &CtxRef) {
+fn render_footer(ctx: &Context) {
     TopBottomPanel::bottom("footer").show(ctx, |ui| {
         ui.vertical_centered(|ui| {
             ui.add_space(10.0);
-            ui.add(Label::new("API source: newsapi.org").monospace());
-            ui.add(
-                Hyperlink::new("https://github.com/emilk/egui")
-                    .text("Made with egui")
-                    .text_style(TextStyle::Monospace),
-            );
+            ui.add(Label::new(
+                RichText::new("API source: newsapi.org").monospace(),
+            ));
+            ui.add(Hyperlink::from_label_and_url(
+                RichText::new("Made with egui").text_style(TextStyle::Monospace),
+                "https://github.com/emilk/egui",
+            ));
             ui.add_space(10.0);
         })
     });
@@ -192,5 +81,6 @@ use eframe::wasm_bindgen::{self, prelude::*};
 pub fn main_web(canvas_id: &str) {
     let headlines = Headlines::new();
     tracing_wasm::set_as_global_default();
-    eframe::start_web(canvas_id, Box::new(headlines));
+    eframe::start_web(canvas_id, Box::new(|cc| Box::new(headlines.init(cc))))
+        .expect("Failed to launch app");
 }

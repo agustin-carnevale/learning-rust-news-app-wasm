@@ -2,4 +2,5 @@
 target
 .env
 
-*.wasm
+webapp/*.wasm
+webapp/*.js
